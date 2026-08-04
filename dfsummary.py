@@ -69,7 +69,7 @@ def _column_stats(s: pd.Series, quantiles=DEFAULT_QUANTILES) -> dict:
     stats["pct_inf"] = n_inf / n if n else np.nan
 
     if is_numeric:
-        finite = s[np.isfinite(s.astype(float))]
+        finite = s[np.isfinite(s.astype(float))].astype(float)  # bool dtype breaks quantile()
         n_zero = int((finite == 0).sum())
         n_negative = int((finite < 0).sum())
         n_positive = int((finite > 0).sum())

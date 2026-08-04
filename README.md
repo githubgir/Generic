@@ -20,7 +20,11 @@ summary["index"]         # names/dtypes/nunique per index level (MultiIndex-awar
 summary["columns"]       # DataFrame: dtype, missing/inf/zero/negative/positive/>1
                           # counts & ratios, nunique, mean/median/std/quantiles
 summary["top_values"]    # {column: top-10 value_counts}
-summary["correlations"]  # {"pearson": ..., "spearman": ...} correlation matrices
+summary["correlations"]  # {"pearson", "spearman": numeric-only; "association": unified
+                          #  rank-based matrix spanning numeric + categorical columns}
+summary["conditional_numeric"]  # {categorical_col: {category: column_stats of the
+                                 #  numeric columns restricted to that category}} -
+                                 #  captures e.g. "group b runs higher than the rest"
 ```
 
 ## Comparing two DataFrames
@@ -65,6 +69,32 @@ verdict: the new case is classified by whichever is closer, its nearest
 *tested* match or its nearest *untested* match. This nearest-neighbor-per-class
 rule self-adapts to how spread out each cluster is and needs no hand-picked
 threshold; even 5-15 well-chosen negatives are enough to start.
+
+## Generating sample data from a summary
+
+```python
+generated = dfs.generate_sample(summary, n=1000, seed=0)  # n defaults to the original row count
+```
+
+Synthesizes a DataFrame that approximately matches a `summarize()` output —
+useful as a test fixture or as a negative example for `assess_coverage()`
+when you don't have (or don't want to keep around) the original data.
+Reconstructs each column's marginal distribution (from stored
+min/quantiles/max for numeric columns, top-N value counts for categorical
+columns), numeric↔numeric dependency via a Gaussian copula built from the
+correlation structure, and categorical↔numeric dependency (e.g. a group
+whose values systematically run higher or lower) via
+`conditional_numeric_stats()`.
+
+This is necessarily approximate — summaries are lossy by design. In
+particular: categorical↔categorical dependence isn't modeled (columns are
+sampled independently of each other), missing/inf ratios are injected
+independently per column, categories beyond the stored top-N become
+synthetic placeholders, datetime columns come back all-`NaT` (not captured
+numerically by `summarize()` yet), and the row index is a plain
+`RangeIndex` rather than a reconstruction of the original values. A good
+sanity check: `dfs.distance(summary, dfs.summarize(generated))` should be
+small.
 
 ## Design notes
 

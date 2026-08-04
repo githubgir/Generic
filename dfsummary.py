@@ -20,6 +20,7 @@ import itertools
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import jensenshannon
+from scipy.stats import norm
 
 # A finer grid than you'd want to *display* is kept here because distance()
 # approximates a Wasserstein distance from these quantiles alone (summaries
@@ -94,6 +95,8 @@ def _column_stats(s: pd.Series, quantiles=DEFAULT_QUANTILES) -> dict:
             mean=float(finite.mean()) if len(finite) else np.nan,
             median=float(finite.median()) if len(finite) else np.nan,
             std=float(finite.std()) if len(finite) else np.nan,
+            min=float(finite.min()) if len(finite) else np.nan,
+            max=float(finite.max()) if len(finite) else np.nan,
         )
         for q in quantiles:
             stats[f"q{q}"] = float(finite.quantile(q)) if len(finite) else np.nan
@@ -103,7 +106,7 @@ def _column_stats(s: pd.Series, quantiles=DEFAULT_QUANTILES) -> dict:
             n_negative=np.nan, pct_negative=np.nan,
             n_positive=np.nan, pct_positive=np.nan,
             n_above_1=np.nan, pct_above_1=np.nan,
-            mean=np.nan, median=np.nan, std=np.nan,
+            mean=np.nan, median=np.nan, std=np.nan, min=np.nan, max=np.nan,
         )
         for q in quantiles:
             stats[f"q{q}"] = np.nan
@@ -123,13 +126,91 @@ def top_values(df: pd.DataFrame, top_n: int = DEFAULT_TOP_N) -> dict:
     return {col: df[col].value_counts().head(top_n) for col in df.columns}
 
 
+def _rank_encode_column(s: pd.Series) -> pd.Series:
+    """Map a column to a numeric proxy suitable for rank correlation: passed
+    through as-is if numeric, or - for categorical/bool columns - each
+    category mapped to the midpoint of its cumulative-frequency interval
+    (e.g. a category covering the most-frequent 30% of rows lands at 0.15).
+    NaNs stay NaN either way. This lets a single corr(method="spearman")
+    call produce one association matrix spanning numeric and categorical
+    columns alike."""
+    if pd.api.types.is_numeric_dtype(s):
+        return s.astype(float)
+    counts = s.value_counts()  # sorted descending by frequency, NaN excluded
+    total = counts.sum()
+    if total == 0:
+        return pd.Series(np.nan, index=s.index)
+    midpoints = (counts.cumsum() - counts / 2) / total
+    return s.map(midpoints)
+
+
+def associations(df: pd.DataFrame) -> pd.DataFrame:
+    """Unified rank-based association matrix spanning numeric, categorical,
+    and boolean columns (datetime columns are excluded). For a pair of
+    numeric columns this is exactly their Spearman correlation; categorical
+    columns participate via the frequency-rank encoding in
+    _rank_encode_column.
+
+    Caveat: for a *nominal* categorical column (no inherent order), this only
+    detects a relationship with another column to the extent that category
+    frequency happens to align with that column's values - e.g. it can miss
+    a real "group b has much higher values than group a" effect if b isn't
+    also the more/less frequent group. It's still a useful drift signal for
+    distance() (a shift in this matrix means *something* about the joint
+    structure changed), but generate_sample() does not rely on it for
+    categorical<->numeric dependence - see conditional_numeric_stats()."""
+    supported = df.select_dtypes(exclude=["datetime", "datetimetz"])
+    encoded = pd.DataFrame({c: _rank_encode_column(supported[c]) for c in supported.columns})
+    return encoded.corr(method="spearman")
+
+
 def correlations(df: pd.DataFrame) -> dict:
-    """Pearson and Spearman correlation matrices for numeric columns."""
+    """Pearson/Spearman matrices for numeric columns, plus a unified
+    association matrix spanning numeric and categorical columns."""
     numeric = df.select_dtypes(include=np.number)
     return {
         "pearson": numeric.corr(method="pearson"),
         "spearman": numeric.corr(method="spearman"),
+        "association": associations(df),
     }
+
+
+def conditional_numeric_stats(
+    df: pd.DataFrame,
+    top_n: int = DEFAULT_TOP_N,
+    quantiles=DEFAULT_QUANTILES,
+) -> dict:
+    """Per-category numeric summaries: {categorical_col: {category: column_stats
+    of the numeric columns restricted to rows where categorical_col == category}}.
+
+    This is what actually captures categorical<->numeric dependence for
+    generate_sample() - e.g. a nominal group whose numeric values run
+    systematically higher or lower than the rest - which associations()'s
+    rank-encoding trick can't reliably represent (see its docstring). Only
+    the categorical column's top-N categories get their own stats; rarer
+    categories fall back to the unconditional marginal at generation time.
+
+    Note this multiplies summary size by roughly
+    n_categorical_cols * top_n * n_numeric_cols - worth keeping in mind if
+    you're persisting many of these summaries.
+    """
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+    categorical_cols = [
+        c for c in df.columns
+        if c not in numeric_cols and not pd.api.types.is_datetime64_any_dtype(df[c])
+    ]
+    result = {}
+    if not numeric_cols or not categorical_cols:
+        return result
+    for cat_col in categorical_cols:
+        per_category = {}
+        for category in df[cat_col].value_counts().head(top_n).index:
+            subset = df.loc[df[cat_col] == category, numeric_cols]
+            if len(subset):
+                per_category[category] = column_stats(subset, quantiles=quantiles)
+        if per_category:
+            result[cat_col] = per_category
+    return result
 
 
 def summarize(
@@ -144,6 +225,7 @@ def summarize(
         "columns": column_stats(df, quantiles=quantiles),
         "top_values": top_values(df, top_n=top_n),
         "correlations": correlations(df),
+        "conditional_numeric": conditional_numeric_stats(df, top_n=top_n, quantiles=quantiles),
     }
 
 
@@ -230,6 +312,8 @@ def _correlation_distance(corr1: pd.DataFrame, corr2: pd.DataFrame) -> float:
     c1, c2 = corr1.loc[common, common].to_numpy(), corr2.loc[common, common].to_numpy()
     iu = np.triu_indices_from(c1, k=1)
     diff = np.abs(c1[iu] - c2[iu])
+    if np.all(np.isnan(diff)):
+        return np.nan
     return float(np.nanmean(diff)) / 2  # |diff| in [0, 2] -> [0, 1]
 
 
@@ -255,8 +339,11 @@ def distance(
 
     Blends: column-set overlap, index schema match, per-column value
     distribution distance (numeric via quantile/Wasserstein approximation,
-    categorical via Jensen-Shannon over top values), and correlation-structure
-    distance. Works entirely off summaries - no raw DataFrame access needed.
+    categorical via Jensen-Shannon over top values), and association-structure
+    distance (the unified numeric+categorical association matrix, so this
+    catches categorical<->numeric or categorical<->categorical drift too, not
+    just numeric<->numeric). Works entirely off summaries - no raw DataFrame
+    access needed.
     """
     default_weights = {"columns": 1.0, "index": 1.0, "distributions": 2.0, "correlation": 1.0}
     weights = {**default_weights, **(weights or {})}
@@ -281,9 +368,9 @@ def distance(
             col_distances.append(_categorical_distribution_distance(top1, top2, non_null1, non_null2))
         else:
             col_distances.append(1.0)  # numeric vs non-numeric: not comparable
-    distributions_dist = float(np.nanmean(col_distances)) if col_distances else np.nan
+    distributions_dist = float(np.nanmean(col_distances)) if col_distances and not np.all(np.isnan(col_distances)) else np.nan
 
-    correlation_dist = _correlation_distance(summary1["correlations"]["pearson"], summary2["correlations"]["pearson"])
+    correlation_dist = _correlation_distance(summary1["correlations"]["association"], summary2["correlations"]["association"])
 
     components = {
         "columns": columns_dist,
@@ -464,3 +551,204 @@ def assess_coverage(
         report["verdict"] = "add_test"
         report["reason"] = f"far outside the typical spread of tested cases (distance {best_positive[1]:.3f} > {thresholds['outer']:.3f})"
     return report
+
+
+# ------------------------------------------------------------------ #
+# Sample generation: synthesize a DataFrame that resembles a summary
+# ------------------------------------------------------------------ #
+
+def _nearest_psd_correlation(corr: np.ndarray) -> np.ndarray:
+    """Project a possibly-invalid correlation matrix (NaNs from zero-variance
+    columns, float rounding drift) onto the nearest valid one via eigenvalue
+    clipping, so Cholesky decomposition below never fails."""
+    corr = np.nan_to_num(corr, nan=0.0)
+    corr = (corr + corr.T) / 2
+    np.fill_diagonal(corr, 1.0)
+    eigvals, eigvecs = np.linalg.eigh(corr)
+    eigvals = np.clip(eigvals, 1e-8, None)
+    reconstructed = eigvecs @ np.diag(eigvals) @ eigvecs.T
+    scale = np.sqrt(np.diag(reconstructed))
+    reconstructed = reconstructed / np.outer(scale, scale)
+    np.fill_diagonal(reconstructed, 1.0)
+    return reconstructed
+
+
+def _numeric_marginal_sample(row: pd.Series, u: np.ndarray) -> np.ndarray:
+    """Inverse-CDF sample from a numeric column's stored min/quantiles/max,
+    via piecewise-linear interpolation of the empirical quantile function."""
+    q_items = sorted(
+        (float(c[1:]), row[c]) for c in row.index
+        if c.startswith("q") and c[1:].replace(".", "", 1).isdigit()
+    )
+    xp = [0.0] + [q for q, _ in q_items] + [1.0]
+    fp = [row["min"]] + [v for _, v in q_items] + [row["max"]]
+    fp = np.maximum.accumulate(fp)  # guard against rounding-induced non-monotonicity
+    return np.interp(u, xp, fp)
+
+
+def _categorical_marginal_sample(top: pd.Series, nunique: int, non_null: int, u: np.ndarray) -> np.ndarray:
+    """Inverse-CDF-style sample from a categorical column's top-N value counts.
+    Probability mass beyond the stored top-N is spread evenly across synthetic
+    placeholder categories sized to make up the recorded nunique, since their
+    individual frequencies were never captured (same "other" bucket idea used
+    for the Jensen-Shannon term in distance())."""
+    categories = list(top.index)
+    probs = list((top / non_null).to_numpy()) if non_null else []
+    n_other = max(0, nunique - len(categories))
+    remaining = max(0.0, 1 - sum(probs))
+    if n_other > 0:
+        categories += [f"__other_{i}__" for i in range(n_other)]
+        probs += [remaining / n_other] * n_other
+    elif remaining > 0 and categories:
+        probs[-1] += remaining  # no room for new categories; pad the last one
+    if not categories:
+        return np.full(len(u), np.nan, dtype=object)
+    boundaries = np.cumsum(probs)
+    boundaries[-1] = 1.0  # guard against float drift
+    idx = np.clip(np.searchsorted(boundaries, u, side="right"), 0, len(categories) - 1)
+    return np.array(categories, dtype=object)[idx]
+
+
+def _best_categorical_predictor(numeric_col: str, overall_std: float, conditional_numeric: dict) -> str | None:
+    """Pick whichever categorical column's top-category means for `numeric_col`
+    vary the most relative to its overall std - i.e. splitting by that column
+    reveals a real group effect worth modeling, versus noise. None if nothing
+    clears a small bar (or `conditional_numeric` has nothing for this column)."""
+    best_col, best_score = None, 0.0
+    if not overall_std or pd.isna(overall_std) or overall_std <= 0:
+        return None
+    for cat_col, per_category in conditional_numeric.items():
+        means = [
+            stats_df.loc[numeric_col, "mean"] for stats_df in per_category.values()
+            if numeric_col in stats_df.index and not pd.isna(stats_df.loc[numeric_col, "mean"])
+        ]
+        if len(means) >= 2:
+            score = float(np.std(means)) / overall_std
+            if score > best_score:
+                best_col, best_score = cat_col, score
+    return best_col if best_score > 0.05 else None
+
+
+def _numeric_sample_conditional(row_default: pd.Series, u: np.ndarray, realized_category: np.ndarray, per_category: dict) -> np.ndarray:
+    """Like _numeric_marginal_sample, but rows whose realized categorical
+    value has its own conditional stats are sampled from that group's
+    quantile function instead of the unconditional marginal - reusing the
+    same u so numeric<->numeric rank correlation is preserved as well as a
+    lossy summary reasonably allows. Rows whose category fell outside the
+    stored top-N fall back to the marginal."""
+    values = np.empty(len(u))
+    filled = np.zeros(len(u), dtype=bool)
+    for category, stats_df in per_category.items():
+        if row_default.name not in stats_df.index:
+            continue
+        mask = realized_category == category
+        if mask.any():
+            values[mask] = _numeric_marginal_sample(stats_df.loc[row_default.name], u[mask])
+            filled |= mask
+    if not filled.all():
+        values[~filled] = _numeric_marginal_sample(row_default, u[~filled])
+    return values
+
+
+def generate_sample(summary: dict, n: int | None = None, seed: int | None = None) -> pd.DataFrame:
+    """Synthesize a DataFrame that approximately matches a summarize() output:
+    per-column marginals (from stored min/quantiles/max for numeric columns,
+    top-N value counts for categorical/boolean columns), numeric<->numeric
+    dependency via a Gaussian copula built from the stored correlation
+    structure, and categorical<->numeric dependency (e.g. a group whose
+    values run systematically higher/lower) via conditional_numeric_stats().
+
+    This is necessarily approximate - summaries are lossy by design - and
+    intended for test fixtures / negative examples for assess_coverage(),
+    not as a substitute for real data:
+    - categorical columns are sampled independently of each other -
+      categorical<->categorical dependence isn't modeled;
+    - missing/inf ratios are injected independently per column, not jointly
+      correlated with other columns' missingness;
+    - categorical values beyond the stored top-N are represented by
+      synthetic placeholder categories with equal assumed probability;
+    - datetime columns aren't reconstructed (summarize() doesn't capture
+      numeric stats for them yet) - they come back all-NaT;
+    - the row index is a plain RangeIndex, not a reconstruction of the
+      original index's values.
+
+    A good sanity check after generating:
+    `distance(summary, summarize(generate_sample(summary)))` should be small.
+    """
+    rng = np.random.default_rng(seed)
+    cols = summary["columns"]
+    n = summary["shape"][0] if n is None else n
+    columns = list(cols.index)
+    numeric_cols = [c for c in columns if _is_numeric_row(cols.loc[c])]
+
+    assoc = summary["correlations"]["association"]
+    u_by_col = {}
+    if len(numeric_cols) >= 2 and n > 0:
+        rho_spearman = assoc.loc[numeric_cols, numeric_cols].to_numpy()
+        rho_gaussian = _nearest_psd_correlation(2 * np.sin(np.pi * np.clip(rho_spearman, -1, 1) / 6))
+        z = rng.standard_normal((n, len(numeric_cols))) @ np.linalg.cholesky(rho_gaussian).T
+        u = norm.cdf(z)
+        u_by_col = {c: u[:, i] for i, c in enumerate(numeric_cols)}
+    for c in numeric_cols:
+        if c not in u_by_col:
+            u_by_col[c] = rng.uniform(0, 1, n)
+
+    # Categorical (and datetime-placeholder) columns first: numeric columns
+    # may need their realized values to sample conditionally below.
+    data = {}
+    for c in columns:
+        row = cols.loc[c]
+        dtype = row["dtype"]
+        if dtype.startswith("datetime"):
+            data[c] = pd.Series(pd.NaT, index=range(n), dtype=dtype)
+        elif c not in numeric_cols:
+            top = summary["top_values"].get(c, pd.Series(dtype=int))
+            non_null = round(n * (1 - row["pct_missing"])) if n else 0
+            data[c] = _categorical_marginal_sample(top, int(row["nunique"]), non_null, rng.uniform(0, 1, n))
+
+    conditional_numeric = summary.get("conditional_numeric", {})
+    for c in numeric_cols:
+        row = cols.loc[c]
+        predictor = _best_categorical_predictor(c, row.get("std"), conditional_numeric)
+        if predictor is not None and predictor in data:
+            values = _numeric_sample_conditional(row, u_by_col[c], np.asarray(data[predictor]), conditional_numeric[predictor])
+        else:
+            values = _numeric_marginal_sample(row, u_by_col[c])
+        dtype = row["dtype"]
+        if dtype == "bool":
+            values = values >= 0.5
+        elif dtype.startswith("int") or dtype.startswith("uint"):
+            values = np.round(values)
+        data[c] = values
+
+    df = pd.DataFrame(data, index=pd.RangeIndex(n), columns=columns)
+
+    for c in columns:
+        row = cols.loc[c]
+        if n == 0:
+            continue
+        n_missing = min(round(n * row["pct_missing"]) if not pd.isna(row["pct_missing"]) else 0, n)
+        missing_idx = rng.choice(n, size=n_missing, replace=False) if n_missing else np.array([], dtype=int)
+        if n_missing:
+            df.loc[missing_idx, c] = pd.NaT if row["dtype"].startswith("datetime") else np.nan
+
+        if _is_numeric_row(row) and not pd.isna(row.get("pct_inf")) and row["pct_inf"]:
+            n_inf = min(round(n * row["pct_inf"]), n - n_missing)
+            if n_inf > 0:
+                remaining = np.setdiff1d(np.arange(n), missing_idx)
+                inf_idx = rng.choice(remaining, size=n_inf, replace=False)
+                df.loc[inf_idx, c] = rng.choice([np.inf, -np.inf], size=n_inf)
+
+    for c in columns:
+        dtype = cols.loc[c, "dtype"]
+        try:
+            if dtype.startswith("int") or dtype.startswith("uint"):
+                df[c] = df[c].astype("Int64" if df[c].isna().any() else dtype)
+            elif dtype == "bool":
+                df[c] = df[c].astype("boolean" if df[c].isna().any() else "bool")
+            elif not dtype.startswith("datetime"):
+                df[c] = df[c].astype(dtype)
+        except (TypeError, ValueError):
+            pass  # best-effort dtype restoration; leave as generated if it doesn't fit
+
+    return df

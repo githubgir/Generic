@@ -86,7 +86,7 @@ SAMPLE_SUMMARIES = {name: dfs.summarize(df) for name, df in SAMPLE_DFS.items()}
 def test_summarize_runs_and_has_expected_keys(name):
     df = SAMPLE_DFS[name]
     result = dfs.summarize(df)
-    assert set(result) == {"shape", "index", "columns", "top_values", "correlations"}
+    assert set(result) == {"shape", "index", "columns", "top_values", "correlations", "conditional_numeric"}
     assert result["shape"] == df.shape
     assert list(result["columns"].index) == list(df.columns)
 
@@ -131,6 +131,37 @@ def test_summarize_index_reports_each_multiindex_level():
     assert [lvl["name"] for lvl in idx_summary["levels"]] == ["group", "sub"]
     assert idx_summary["levels"][0]["dtype"] == "str"
     assert idx_summary["levels"][1]["nunique"] == 4
+
+
+def test_associations_matrix_spans_numeric_and_categorical_columns():
+    rng = np.random.default_rng(0)
+    n = 300
+    group = rng.choice(["a", "b"], n)
+    value = rng.normal(0, 1, n)
+    df = pd.DataFrame({"group": group, "value": value})
+    assoc = dfs.associations(df)
+    assert set(assoc.columns) == {"group", "value"}
+    assert assoc.loc["group", "group"] == pytest.approx(1.0)
+    assert assoc.loc["value", "value"] == pytest.approx(1.0)
+
+
+def test_conditional_numeric_stats_captures_group_mean_shift():
+    rng = np.random.default_rng(0)
+    n = 400
+    group = rng.choice(["a", "b"], n)
+    value = np.where(group == "a", rng.normal(0, 1, n), rng.normal(20, 1, n))
+    df = pd.DataFrame({"group": group, "value": value})
+    stats = dfs.conditional_numeric_stats(df)
+    assert set(stats) == {"group"}
+    means = {cat: s.loc["value", "mean"] for cat, s in stats["group"].items()}
+    assert means["a"] == pytest.approx(0.0, abs=0.5)
+    assert means["b"] == pytest.approx(20.0, abs=0.5)
+
+
+def test_conditional_numeric_stats_empty_without_both_column_types():
+    assert dfs.conditional_numeric_stats(make_numeric_df()) == {}
+    only_categorical = pd.DataFrame({"cat": ["a", "b", "c"]})
+    assert dfs.conditional_numeric_stats(only_categorical) == {}
 
 
 # ------------------------------------------------------------------ #
@@ -279,3 +310,68 @@ def test_assess_coverage_accepts_precomputed_summary():
     summary = dfs.summarize(make_numeric_df(seed=1))
     report = dfs.assess_coverage(summary, positive)
     assert report["verdict"] == "covered"
+
+
+# ------------------------------------------------------------------ #
+# generate_sample()
+# ------------------------------------------------------------------ #
+
+@pytest.mark.parametrize("name", SAMPLE_DFS)
+def test_generate_sample_matches_shape_and_round_trips_with_small_distance(name):
+    df = SAMPLE_DFS[name]
+    summary = dfs.summarize(df)
+    generated = dfs.generate_sample(summary, seed=0)
+    assert generated.shape == df.shape
+    assert list(generated.columns) == list(df.columns)
+    # generate_sample() always emits a plain RangeIndex (index reconstruction
+    # is an accepted out-of-scope limitation - see its docstring), so exclude
+    # the index component here: this check is about data fidelity, not index.
+    d = dfs.distance(summary, dfs.summarize(generated), weights={"index": 0})
+    assert np.isnan(d) or d < 0.15
+
+
+def test_generate_sample_is_reproducible_with_same_seed():
+    summary = dfs.summarize(make_numeric_df())
+    a = dfs.generate_sample(summary, seed=7)
+    b = dfs.generate_sample(summary, seed=7)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_generate_sample_approximately_preserves_missing_ratio():
+    df = make_missing_inf_df()
+    summary = dfs.summarize(df)
+    generated = dfs.generate_sample(summary, seed=3)
+    original_ratio = df["messy"].isna().mean()
+    generated_ratio = generated["messy"].isna().mean()
+    assert generated_ratio == pytest.approx(original_ratio, abs=0.05)
+
+
+def test_generate_sample_reproduces_categorical_group_mean_shift():
+    rng = np.random.default_rng(0)
+    n = 500
+    group = rng.choice(["a", "b", "c"], n, p=[0.5, 0.3, 0.2])
+    value = np.select(
+        [group == "a", group == "b", group == "c"],
+        [rng.normal(0, 1, n), rng.normal(10, 1, n), rng.normal(-5, 2, n)],
+    )
+    df = pd.DataFrame({"group": group, "value": value})
+    summary = dfs.summarize(df)
+    generated = dfs.generate_sample(summary, seed=42)
+
+    original_means = df.groupby("group")["value"].mean()
+    generated_means = generated.groupby("group")["value"].mean()
+    for group_name in original_means.index:
+        assert generated_means[group_name] == pytest.approx(original_means[group_name], abs=1.5)
+
+
+def test_generate_sample_with_custom_n():
+    summary = dfs.summarize(make_numeric_df())
+    generated = dfs.generate_sample(summary, n=25, seed=0)
+    assert generated.shape[0] == 25
+
+
+def test_generate_sample_handles_empty_summary():
+    summary = dfs.summarize(make_empty_df())
+    generated = dfs.generate_sample(summary, seed=0)
+    assert generated.shape == (0, 2)
+    assert list(generated.columns) == ["a", "b"]

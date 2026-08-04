@@ -1,17 +1,20 @@
 """Summarize and compare pandas DataFrames.
 
 Public API:
-    summarize(df)                          -> dict describing one DataFrame
+    summarize(df)                          -> Summary (dict) describing one DataFrame
+    summary.display()                      -> DisplaySummary: dict of readable DataFrames
     compare(df1, df2)                      -> dict comparing two DataFrames
     distance(summary1, summary2)           -> single float in [0, 1], 0 = identical
     nearest_matches(summary, reference)    -> reference entries ranked by distance
     assess_coverage(df, positive, negative)-> verdict on whether df needs a new test
+    generate_sample(summary, n, seed)      -> DataFrame synthesized from a summary
 
 distance() and everything built on it (nearest_matches, assess_coverage) work on
 the dicts returned by summarize() rather than on raw DataFrames. That's what
 makes them cheap to run against a reference set of hundreds of persisted
 summaries in production, without needing to keep the original reference
-DataFrames around.
+DataFrames around. Summary is a plain dict subclass, so all of that keeps
+working on summarize() output exactly as before - it only adds .display().
 """
 from __future__ import annotations
 
@@ -64,6 +67,7 @@ def _column_stats(s: pd.Series, quantiles=DEFAULT_QUANTILES) -> dict:
     n = len(s)
     is_numeric = pd.api.types.is_numeric_dtype(s)
     is_float = pd.api.types.is_float_dtype(s)
+    is_datetime = pd.api.types.is_datetime64_any_dtype(s)
 
     n_missing = int(s.isna().sum())
     stats = {
@@ -72,6 +76,14 @@ def _column_stats(s: pd.Series, quantiles=DEFAULT_QUANTILES) -> dict:
         "pct_missing": n_missing / n if n else np.nan,
         "nunique": int(s.nunique(dropna=True)),
     }
+
+    # Display-only range for datetime columns; deliberately not folded into
+    # the numeric branch below (mean/std/quantiles) - the numeric/categorical
+    # split drives distance()/generate_sample()'s branching elsewhere, and
+    # datetime arithmetic doesn't behave the same way as plain float math.
+    non_null_dt = s.dropna()
+    stats["dt_min"] = non_null_dt.min() if is_datetime and len(non_null_dt) else pd.NaT
+    stats["dt_max"] = non_null_dt.max() if is_datetime and len(non_null_dt) else pd.NaT
 
     if is_float:
         inf_mask = np.isinf(s.to_numpy(dtype=float, na_value=0.0))
@@ -213,20 +225,156 @@ def conditional_numeric_stats(
     return result
 
 
+class Summary(dict):
+    """dict returned by summarize(). A drop-in dict everywhere else in this
+    module (summary["columns"], summary["correlations"]["pearson"], etc. all
+    keep working exactly as before - this only adds a .display() method for
+    a human-readable table view)."""
+
+    def display(self, decimals: int = 3) -> "DisplaySummary":
+        return display_summary(self, decimals=decimals)
+
+
 def summarize(
     df: pd.DataFrame,
     quantiles=DEFAULT_QUANTILES,
     top_n: int = DEFAULT_TOP_N,
-) -> dict:
+) -> Summary:
     """Full summary of a single DataFrame."""
-    return {
+    return Summary({
         "shape": df.shape,
         "index": summarize_index(df.index),
         "columns": column_stats(df, quantiles=quantiles),
         "top_values": top_values(df, top_n=top_n),
         "correlations": correlations(df),
         "conditional_numeric": conditional_numeric_stats(df, top_n=top_n, quantiles=quantiles),
-    }
+    })
+
+
+class DisplaySummary(dict):
+    """dict of {name: DataFrame} returned by display_summary() / Summary.display().
+    A plain dict everywhere (displayed["columns"], displayed["top_values"], ...)
+    but renders every table automatically when it's the last expression in a
+    Jupyter cell, or via print()/str() in a plain console."""
+
+    def _repr_html_(self) -> str:
+        parts = []
+        for name, table in self.items():
+            parts.append(f"<h4>{name}</h4>")
+            parts.append(table.to_html() if isinstance(table, pd.DataFrame) else f"<pre>{table}</pre>")
+        return "".join(parts)
+
+    def __repr__(self) -> str:
+        parts = [f"=== {name} ===\n{table}" for name, table in self.items()]
+        return "\n\n".join(parts)
+
+
+def display_summary(summary: dict, decimals: int = 3) -> DisplaySummary:
+    """Human-readable view of a summarize() output, as a dict of DataFrames:
+
+    - "overview": row/column counts by type, overall missing %.
+    - "columns": one row per column - type, dtype, missing/zero/negative/
+      positive/>1 % (numeric), nunique, mean/median/std/quantiles/min/max
+      (numeric), top category + its % (categorical), date range (datetime).
+    - "top_values": every column's top-N value counts in one tidy long table
+      (columns, rank, value, count, pct), instead of a dict of Series.
+    - "correlations": the unified numeric+categorical association matrix,
+      rounded.
+
+    Works on any dict shaped like a summarize() output, including ones
+    deserialized from storage that lost the Summary class identity - you
+    don't need a live Summary instance to call this.
+    """
+    cols = summary["columns"]
+    n = summary["shape"][0]
+    q_fields = _quantile_fields(cols.columns)
+
+    def _col_kind(row) -> str:
+        if str(row["dtype"]).startswith("datetime"):
+            return "datetime"
+        return "numeric" if _is_numeric_row(row) else "categorical"
+
+    kinds = {c: _col_kind(cols.loc[c]) for c in cols.index}
+    overview = pd.DataFrame({
+        "metric": ["rows", "columns", "numeric_columns", "categorical_columns", "datetime_columns", "overall_missing_pct"],
+        "value": [
+            n,
+            len(cols),
+            sum(k == "numeric" for k in kinds.values()),
+            sum(k == "categorical" for k in kinds.values()),
+            sum(k == "datetime" for k in kinds.values()),
+            round(float(cols["pct_missing"].mean()) * 100, decimals) if len(cols) else 0.0,
+        ],
+    })
+
+    def _pct(row, field):
+        v = row.get(field)
+        return round(float(v) * 100, decimals) if v is not None and not pd.isna(v) else np.nan
+
+    def _num(row, field):
+        v = row.get(field)
+        return round(float(v), decimals) if v is not None and not pd.isna(v) else np.nan
+
+    rows = []
+    for c in cols.index:
+        row = cols.loc[c]
+        kind = kinds[c]
+        is_num = kind == "numeric"
+        top = summary["top_values"].get(c)
+        non_null = round(n * (1 - row["pct_missing"])) if n and not pd.isna(row["pct_missing"]) else 0
+        top_value, top_value_pct = np.nan, np.nan
+        if top is not None and len(top) and non_null:
+            top_value = top.index[0]
+            top_value_pct = round(float(top.iloc[0]) / non_null * 100, decimals)
+
+        entry = {
+            "column": c,
+            "type": kind,
+            "dtype": row["dtype"],
+            "missing_pct": _pct(row, "pct_missing"),
+            "nunique": row["nunique"],
+            "mean": _num(row, "mean") if is_num else np.nan,
+            "median": _num(row, "median") if is_num else np.nan,
+            "std": _num(row, "std") if is_num else np.nan,
+            "min": _num(row, "min") if is_num else np.nan,
+        }
+        for level, name in q_fields:
+            entry[f"q{level}"] = _num(row, name) if is_num else np.nan
+        entry.update({
+            "max": _num(row, "max") if is_num else np.nan,
+            "zero_pct": _pct(row, "pct_zero") if is_num else np.nan,
+            "negative_pct": _pct(row, "pct_negative") if is_num else np.nan,
+            "positive_pct": _pct(row, "pct_positive") if is_num else np.nan,
+            "above_1_pct": _pct(row, "pct_above_1") if is_num else np.nan,
+            "inf_pct": _pct(row, "pct_inf"),
+            "top_value": top_value,
+            "top_value_pct": top_value_pct,
+            "date_min": row.get("dt_min", pd.NaT) if kind == "datetime" else pd.NaT,
+            "date_max": row.get("dt_max", pd.NaT) if kind == "datetime" else pd.NaT,
+        })
+        rows.append(entry)
+    columns_table = pd.DataFrame(rows).set_index("column")
+
+    top_values_rows = []
+    for c, counts in summary["top_values"].items():
+        row = cols.loc[c]
+        non_null = round(n * (1 - row["pct_missing"])) if n and not pd.isna(row["pct_missing"]) else 0
+        for rank, (value, count) in enumerate(counts.items(), start=1):
+            top_values_rows.append({
+                "column": c,
+                "rank": rank,
+                "value": value,
+                "count": int(count),
+                "pct": round(float(count) / non_null * 100, decimals) if non_null else np.nan,
+            })
+    top_values_table = pd.DataFrame(top_values_rows, columns=["column", "rank", "value", "count", "pct"])
+
+    return DisplaySummary({
+        "overview": overview,
+        "columns": columns_table,
+        "top_values": top_values_table,
+        "correlations": summary["correlations"]["association"].round(decimals),
+    })
 
 
 # ------------------------------------------------------------------ #
@@ -278,9 +426,18 @@ def _is_numeric_row(row: pd.Series) -> bool:
     return not pd.isna(row.get("mean"))
 
 
+def _quantile_fields(index_like) -> list:
+    """(level, field_name) pairs for the q<level> fields in a column_stats
+    row/frame, sorted by level - e.g. [(0.05, "q0.05"), (0.1, "q0.1"), ...]."""
+    return sorted(
+        (float(c[1:]), c) for c in index_like
+        if c.startswith("q") and c[1:].replace(".", "", 1).isdigit()
+    )
+
+
 def _numeric_distribution_distance(row1: pd.Series, row2: pd.Series) -> float:
     """Wasserstein-ish distance approximated from quantiles alone (no raw values)."""
-    q_cols = [c for c in row1.index if c.startswith("q") and c[1:].replace(".", "", 1).isdigit()]
+    q_cols = [name for _, name in _quantile_fields(row1.index)]
     diffs = [abs(row1[c] - row2[c]) for c in q_cols if not (pd.isna(row1[c]) or pd.isna(row2[c]))]
     if not diffs:
         return np.nan
@@ -576,10 +733,7 @@ def _nearest_psd_correlation(corr: np.ndarray) -> np.ndarray:
 def _numeric_marginal_sample(row: pd.Series, u: np.ndarray) -> np.ndarray:
     """Inverse-CDF sample from a numeric column's stored min/quantiles/max,
     via piecewise-linear interpolation of the empirical quantile function."""
-    q_items = sorted(
-        (float(c[1:]), row[c]) for c in row.index
-        if c.startswith("q") and c[1:].replace(".", "", 1).isdigit()
-    )
+    q_items = [(level, row[name]) for level, name in _quantile_fields(row.index)]
     xp = [0.0] + [q for q, _ in q_items] + [1.0]
     fp = [row["min"]] + [v for _, v in q_items] + [row["max"]]
     fp = np.maximum.accumulate(fp)  # guard against rounding-induced non-monotonicity

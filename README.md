@@ -27,6 +27,31 @@ summary["conditional_numeric"]  # {categorical_col: {category: column_stats of t
                                  #  captures e.g. "group b runs higher than the rest"
 ```
 
+`summarize()` returns a `Summary` — a plain `dict` subclass, so all of the
+above keeps working exactly as shown. It adds one thing: `.display()`.
+
+## Displaying a summary
+
+```python
+summary.display()   # or: dfs.display_summary(summary)
+```
+
+Returns a `DisplaySummary` (also just a dict of DataFrames) with:
+
+- `"overview"` — row/column counts by type, overall missing %.
+- `"columns"` — one row per column: type (numeric / categorical / datetime),
+  dtype, missing %, nunique, mean/median/std/quantiles/min/max for numeric
+  columns, zero/negative/positive/>1 %, top category + its % for categorical
+  columns, date range for datetime columns.
+- `"top_values"` — every column's top-N value counts in one tidy long table
+  (`column`, `rank`, `value`, `count`, `pct`) instead of a dict of Series.
+- `"correlations"` — the unified association matrix, rounded.
+
+In a Jupyter cell, `summary.display()` as the last expression renders all of
+these as formatted tables. `dfs.display_summary()` also works on a plain
+dict shaped like a `summarize()` output — e.g. one deserialized from
+storage that lost the `Summary` class identity.
+
 ## Comparing two DataFrames
 
 ```python

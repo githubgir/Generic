@@ -133,6 +133,14 @@ def test_summarize_index_reports_each_multiindex_level():
     assert idx_summary["levels"][1]["nunique"] == 4
 
 
+def test_column_stats_captures_datetime_range():
+    df = make_datetime_df(n=10)
+    stats = dfs.column_stats(df).loc["date_col"]
+    assert stats["dt_min"] == pd.Timestamp("2020-01-01")
+    assert stats["dt_max"] == pd.Timestamp("2020-01-10")
+    assert pd.isna(stats["mean"])  # datetime stays out of the numeric branch
+
+
 def test_associations_matrix_spans_numeric_and_categorical_columns():
     rng = np.random.default_rng(0)
     n = 300
@@ -375,3 +383,89 @@ def test_generate_sample_handles_empty_summary():
     generated = dfs.generate_sample(summary, seed=0)
     assert generated.shape == (0, 2)
     assert list(generated.columns) == ["a", "b"]
+
+
+# ------------------------------------------------------------------ #
+# display_summary() / Summary.display()
+# ------------------------------------------------------------------ #
+
+def make_stock_like_df(seed=0, n=200):
+    rng = np.random.default_rng(seed)
+    industry = rng.choice(["Tech", "Financials", "Healthcare"], n, p=[0.5, 0.3, 0.2])
+    pe_ratio = np.where(industry == "Tech", rng.normal(35, 8, n), rng.normal(15, 5, n))
+    pe_ratio[rng.choice(n, max(1, n // 20), replace=False)] = np.nan
+    price = rng.lognormal(4, 1, n)
+    price[rng.choice(n, max(1, n // 30), replace=False)] = 0.0
+    return pd.DataFrame({
+        "ticker": [f"T{i:04d}" for i in range(n)],
+        "industry": industry,
+        "price": price,
+        "pe_ratio": pe_ratio,
+        "as_of_date": pd.date_range("2024-01-01", periods=n, freq="D"),
+    })
+
+
+def test_summarize_returns_summary_with_display_method():
+    summary = dfs.summarize(make_stock_like_df())
+    assert isinstance(summary, dict)  # still a plain dict everywhere else
+    assert hasattr(summary, "display")
+    assert summary["shape"] == (200, 5)  # dict-style access unaffected
+
+
+def test_display_summary_returns_expected_tables():
+    summary = dfs.summarize(make_stock_like_df())
+    displayed = summary.display()
+    assert isinstance(displayed, dfs.DisplaySummary)
+    assert set(displayed) == {"overview", "columns", "top_values", "correlations"}
+    for table in displayed.values():
+        assert isinstance(table, pd.DataFrame)
+
+
+def test_display_summary_columns_table_classifies_types_correctly():
+    summary = dfs.summarize(make_stock_like_df())
+    columns_table = summary.display()["columns"]
+    assert columns_table.loc["ticker", "type"] == "categorical"
+    assert columns_table.loc["industry", "type"] == "categorical"
+    assert columns_table.loc["price", "type"] == "numeric"
+    assert columns_table.loc["pe_ratio", "type"] == "numeric"
+    assert columns_table.loc["as_of_date", "type"] == "datetime"
+    # numeric stats populated for numeric, blank for categorical/datetime
+    assert not pd.isna(columns_table.loc["price", "mean"])
+    assert pd.isna(columns_table.loc["ticker", "mean"])
+    assert pd.isna(columns_table.loc["as_of_date", "mean"])
+    # date range populated only for the datetime column
+    assert columns_table.loc["as_of_date", "date_min"] == pd.Timestamp("2024-01-01")
+    assert pd.isna(columns_table.loc["price", "date_min"])
+
+
+def test_display_summary_columns_table_reports_missing_zero_and_negative_pct():
+    df = pd.DataFrame({"x": [np.nan, 0.0, 0.0, -1.0, 2.0, 3.0, 4.0, 5.0]})
+    columns_table = dfs.summarize(df).display()["columns"]
+    row = columns_table.loc["x"]
+    assert row["missing_pct"] == pytest.approx(12.5)
+    assert row["zero_pct"] == pytest.approx(25.0)
+    assert row["negative_pct"] == pytest.approx(12.5)
+
+
+def test_display_summary_top_values_table_is_tidy_and_sums_to_non_null_count():
+    df = pd.DataFrame({"cat": ["a"] * 5 + ["b"] * 3 + ["c"] * 2})
+    top_values_table = dfs.summarize(df).display()["top_values"]
+    cat_rows = top_values_table[top_values_table["column"] == "cat"]
+    assert list(cat_rows["value"]) == ["a", "b", "c"]
+    assert list(cat_rows["count"]) == [5, 3, 2]
+    assert cat_rows["pct"].sum() == pytest.approx(100.0)
+
+
+def test_display_summary_works_on_plain_dict_after_losing_class_identity():
+    summary = dfs.summarize(make_stock_like_df())
+    plain = dict(summary)  # simulates deserializing a persisted summary
+    displayed = dfs.display_summary(plain)
+    assert isinstance(displayed, dfs.DisplaySummary)
+    assert "columns" in displayed
+
+
+def test_display_summary_repr_renders_without_error():
+    summary = dfs.summarize(make_stock_like_df(n=20))
+    displayed = summary.display()
+    assert "overview" in repr(displayed)
+    assert "<table" in displayed._repr_html_()

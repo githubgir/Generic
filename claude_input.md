@@ -422,3 +422,73 @@ Implemented the fix:
   stated limitations (no categorical<->categorical dependence, independent
   missing/inf injection, synthetic placeholder categories beyond top-N,
   all-NaT datetime columns, placeholder RangeIndex).
+
+---
+
+## Turn 10 — User
+
+> Add a display method for summary which should be ideally in form of a
+> dataframe or a set of dataframes
+> The dataframe is a set of stock constituents in an index with prices,
+> fundamental values, rations, stock names, industry classification,
+> counties, regions, dates, with missing data, with 0s, with negative
+> values.
+
+## Turn 10 — Assistant
+
+Took "display *method*" literally: `summarize()` now returns a `Summary` -
+a `dict` subclass, so every existing dict-style access
+(`summary["columns"]`, etc.) and every function built on it (`distance()`,
+`compare()`, `assess_coverage()`, `generate_sample()`) keeps working
+unchanged - with one addition, `summary.display()`.
+
+Closed a gap first: datetime columns ("dates" in the described dataset)
+had essentially nothing captured before this (`is_numeric_dtype` excludes
+them, so they only got dtype/missing/nunique). Added `dt_min`/`dt_max` to
+`_column_stats` for datetime columns specifically - deliberately *not*
+folded into the existing numeric branch (mean/std/quantiles), to avoid
+disturbing the numeric/categorical classification that `distance()` and
+`generate_sample()` already depend on.
+
+Also factored out `_quantile_fields()`, a small shared helper for finding
+the `q<level>` fields in a column_stats row, replacing two independent
+inline implementations of the same logic in `_numeric_distribution_distance`
+and `_numeric_marginal_sample` (noticed while building the quantile columns
+for the display table).
+
+`display_summary(summary, decimals=3)` (called via `summary.display()`)
+returns a `DisplaySummary` - another dict subclass, this one for the output
+side: same as a plain `{name: DataFrame}` dict everywhere, but adds
+`_repr_html_`/`__repr__` so it renders as formatted tables automatically as
+the last expression in a Jupyter cell, or via `print()` in a console. Its
+tables:
+
+- `"overview"` - row/column counts by type, overall missing %.
+- `"columns"` - one row per column: type (numeric/categorical/datetime),
+  dtype, missing %, nunique, mean/median/std/quantiles/min/max for numeric
+  columns, zero/negative/positive/>1 % for numeric columns, top category +
+  its % for categorical columns, date range for datetime columns.
+- `"top_values"` - every column's top-N value counts flattened into one
+  tidy long table (column, rank, value, count, pct) instead of a dict of
+  per-column Series.
+- `"correlations"` - the unified association matrix (from turn 9), rounded.
+
+Verified against a synthetic dataset shaped like the one described (ticker,
+industry, country, region, price, P/E ratio, dividend yield, as-of date,
+with missing fundamentals, a placeholder 0 price for halted stocks, and
+negative P/E from negative earnings) - all fields rendered sensibly,
+including the date range for the date column. Also checked: `display_summary()`
+works on a plain dict that's lost the `Summary` class identity (e.g. after
+a naive deserialization), and `Summary`/`DisplaySummary` both round-trip
+through `pickle` correctly since the classes are module-level and
+importable.
+
+Added tests: `dt_min`/`dt_max` capture, that `summarize()` still returns a
+plain-dict-compatible object with a `.display()` method attached, the
+returned tables' shape/keys, correct type classification per column
+(numeric/categorical/datetime) including that numeric stats are blank for
+non-numeric columns and vice versa, missing/zero/negative % correctness on
+a hand-built column, the top-values table's tidiness (percentages summing
+to 100%), the plain-dict fallback path, and that both repr methods render
+without error. All 48 tests pass. Updated `README.md` with a "Displaying a
+summary" section.

@@ -75,6 +75,8 @@ SAMPLE_DFS = {
     "empty": make_empty_df(),
 }
 
+SAMPLE_SUMMARIES = {name: dfs.summarize(df) for name, df in SAMPLE_DFS.items()}
+
 
 # ------------------------------------------------------------------ #
 # summarize()
@@ -161,7 +163,7 @@ def test_column_comparison_flags_dtype_mismatch_and_diffs():
 
 
 def test_distance_is_symmetric_across_all_sample_pairs():
-    for a, b in itertools.combinations(SAMPLE_DFS.values(), 2):
+    for a, b in itertools.combinations(SAMPLE_SUMMARIES.values(), 2):
         d_ab, d_ba = dfs.distance(a, b), dfs.distance(b, a)
         if np.isnan(d_ab):
             assert np.isnan(d_ba)
@@ -170,15 +172,15 @@ def test_distance_is_symmetric_across_all_sample_pairs():
 
 
 def test_distance_within_bounds_for_all_sample_pairs():
-    for a, b in itertools.combinations(SAMPLE_DFS.values(), 2):
+    for a, b in itertools.combinations(SAMPLE_SUMMARIES.values(), 2):
         d = dfs.distance(a, b)
         assert np.isnan(d) or 0.0 <= d <= 1.0
 
 
 def test_distance_increases_with_distribution_shift():
-    base = make_numeric_df(seed=1)
-    similar = make_numeric_df(seed=2)               # same distribution, different sample
-    shifted = make_numeric_df(seed=3, loc=5.0)       # shifted mean
+    base = dfs.summarize(make_numeric_df(seed=1))
+    similar = dfs.summarize(make_numeric_df(seed=2))              # same distribution, different sample
+    shifted = dfs.summarize(make_numeric_df(seed=3, loc=5.0))     # shifted mean
 
     d_similar = dfs.distance(base, similar)
     d_shifted = dfs.distance(base, shifted)
@@ -192,14 +194,15 @@ def test_distance_detects_correlation_structure_change():
     df_correlated = pd.DataFrame({"x": x, "y": x + rng.normal(0, 0.01, n)})
     df_uncorrelated = pd.DataFrame({"x": x, "y": rng.normal(0, 1, n)})
 
-    d_same_corr = dfs.distance(df_correlated, df_correlated.copy())
-    d_diff_corr = dfs.distance(df_correlated, df_uncorrelated)
+    d_same_corr = dfs.distance(dfs.summarize(df_correlated), dfs.summarize(df_correlated.copy()))
+    d_diff_corr = dfs.distance(dfs.summarize(df_correlated), dfs.summarize(df_uncorrelated))
     assert d_diff_corr > d_same_corr
 
 
 def test_distance_handles_unhashable_index_without_crashing():
-    df1, df2 = make_unhashable_index_df(), make_unhashable_index_df()
-    d = dfs.distance(df1, df2)
+    summary1 = dfs.summarize(make_unhashable_index_df())
+    summary2 = dfs.summarize(make_unhashable_index_df())
+    d = dfs.distance(summary1, summary2)
     assert isinstance(d, float)
 
 
@@ -207,3 +210,72 @@ def test_compare_handles_unhashable_index_without_crashing():
     df1, df2 = make_unhashable_index_df(), make_unhashable_index_df()
     result = dfs.compare(df1, df2)
     assert result["index_overlap"] is None
+
+
+# ------------------------------------------------------------------ #
+# nearest_matches() / assess_coverage()
+# ------------------------------------------------------------------ #
+
+def test_nearest_matches_ranks_closest_first_and_respects_k():
+    target = dfs.summarize(make_numeric_df(seed=100))
+    reference = {
+        "close": dfs.summarize(make_numeric_df(seed=101)),
+        "far": dfs.summarize(make_numeric_df(seed=200, loc=10.0, scale=5.0)),
+        "medium": dfs.summarize(make_numeric_df(seed=102, loc=1.0)),
+    }
+    ranked = dfs.nearest_matches(target, reference, k=2)
+    assert len(ranked) == 2
+    assert ranked[0][0] == "close"
+    assert ranked[0][1] <= ranked[1][1]
+
+
+def test_assess_coverage_flags_schema_gap_regardless_of_distance():
+    positive = {"p1": dfs.summarize(make_numeric_df(seed=1))}
+    # near-identical distribution, but with an extra column never seen in the positive set
+    new_df = make_numeric_df(seed=1)
+    new_df["extra_col"] = 1.0
+    report = dfs.assess_coverage(new_df, positive)
+    assert report["verdict"] == "add_test"
+    assert "extra_col" in report["schema_gap_columns"]
+
+
+def test_assess_coverage_flags_dtype_change_as_schema_gap():
+    positive = {"p1": dfs.summarize(pd.DataFrame({"a": [1, 2, 3]}))}
+    new_df = pd.DataFrame({"a": [1.0, 2.0, 3.0]})  # same column name, different dtype
+    report = dfs.assess_coverage(new_df, positive)
+    assert report["verdict"] == "add_test"
+    assert "a" in report["schema_gap_columns"]
+
+
+def test_assess_coverage_with_negatives_prefers_closer_class():
+    positive = {f"p{i}": dfs.summarize(make_numeric_df(seed=i, loc=0.0)) for i in range(5)}
+    negative = {f"n{i}": dfs.summarize(make_numeric_df(seed=50 + i, loc=8.0)) for i in range(5)}
+
+    covered_case = make_numeric_df(seed=42, loc=0.1)   # close to the positive cluster
+    gap_case = make_numeric_df(seed=43, loc=7.9)       # close to the negative cluster
+
+    covered_report = dfs.assess_coverage(covered_case, positive, negative)
+    gap_report = dfs.assess_coverage(gap_case, positive, negative)
+
+    assert covered_report["verdict"] == "covered"
+    assert gap_report["verdict"] == "add_test"
+
+
+def test_assess_coverage_without_negatives_uses_self_calibrated_threshold():
+    positive = {f"p{i}": dfs.summarize(make_numeric_df(seed=i, loc=0.0)) for i in range(10)}
+    covered_case = make_numeric_df(seed=99, loc=0.05)   # within the positive spread
+    outlier_case = make_numeric_df(seed=98, loc=50.0, scale=20.0)  # way outside it
+
+    covered_report = dfs.assess_coverage(covered_case, positive)
+    outlier_report = dfs.assess_coverage(outlier_case, positive)
+
+    assert covered_report["verdict"] == "covered"
+    assert outlier_report["verdict"] == "add_test"
+    assert "thresholds" in outlier_report
+
+
+def test_assess_coverage_accepts_precomputed_summary():
+    positive = {"p1": dfs.summarize(make_numeric_df(seed=1))}
+    summary = dfs.summarize(make_numeric_df(seed=1))
+    report = dfs.assess_coverage(summary, positive)
+    assert report["verdict"] == "covered"
